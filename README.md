@@ -106,8 +106,18 @@ python3 shallowtimeline.py -f jsonl -e --time-label mtime --ref-date 2026-10-30 
 {"time": "2024-02-29T01:02:00", "timestamp_type": "mtime", "size": 21, "filename": "/etc/localtime", "type": "symlink", "perms": "lrwxrwxrwx", "links": 1, "owner": "root", "group": "root", "link_target": "/usr/share/zoneinfo/UTC", "precision": "minute", "year_inferred": true, "source": "listing.txt:7"}
 ```
 
-**Compressed listings** (gzip, bzip2 and xz are detected from the file's
-first bytes, so the extension doesn't matter and renamed files still work):
+**Compressed listings.** A full-disk `ls -alR` is often hundreds of
+megabytes and compresses about 10:1, so compress it as you collect it:
+
+```sh
+# On the target system
+ls -alR / 2>/dev/null | gzip -c > listing.txt.gz
+```
+
+Put the `2>/dev/null` on `ls`, not on `gzip`; it hides the "Permission denied"
+noise, which never goes into the file anyway. Then parse the file as it is.
+gzip, bzip2 and xz are detected from the file's first bytes, so the
+extension doesn't matter and renamed files still work:
 
 ```sh
 python3 shallowtimeline.py --ref-date 2026-10-30 listing.txt.gz
