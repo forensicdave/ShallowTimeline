@@ -25,6 +25,8 @@ Notes for analysts:
   * Default-style listings only give minute (recent) or day (old) precision.
     The 'precision' field (with --extended) records this.
   * Times are local to the system that ran ls unless full-iso was used.
+  * If the source clock was wrong, --skew moves every timestamp by the
+    measured offset. Entries dated after --ref-date are reported.
 
 Windows `dir /s` notes:
   * Dates follow the system locale (MM/DD/YYYY, DD/MM/YYYY, YYYY-MM-DD).
@@ -66,6 +68,8 @@ import sys
 import time
 import zipfile
 from datetime import date, datetime, timedelta, timezone
+
+__version__ = "0.2.0"
 
 log = logging.getLogger("shallowtimeline")
 VERBOSE = 15  # between INFO and DEBUG
@@ -700,6 +704,17 @@ def bodyfile_rows(records):
     return rows
 
 
+def parse_skew(s):
+    """Clock skew such as '300', '-5m', '1h30m' or '2d' -> signed seconds.
+    Positive means the source clock was ahead of true time."""
+    m = re.fullmatch(r"([+-]?)((?:\d+[smhd]?)+)", s.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"bad skew {s!r}; use seconds or e.g. -5m, 1h30m, 2d")
+    units = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+    total = sum(int(n) * units[u] for n, u in re.findall(r"(\d+)([smhd]?)", m.group(2)))
+    return -total if m.group(1) == "-" else total
+
+
 def sort_key(rec):
     dt = rec["time"]
     # Mixed aware/naive can't be compared; compare aware ones in UTC as naive.
@@ -714,6 +729,7 @@ def main(argv=None):
                     "(time, size, filename).",
         epilog="Example: shallowtimeline.py -f jsonl --ref-date 2026-10-30 listing.txt > timeline.jsonl",
     )
+    ap.add_argument("--version", action="version", version=f"ShallowTimeline {__version__}")
     ap.add_argument("inputs", nargs="*", help="listing files or zips of them, optionally "
                          "gzip/bzip2/xz compressed "
                          "(default: stdin, '-' also means stdin)")
@@ -743,6 +759,9 @@ def main(argv=None):
                     help="skip directories (and Windows junctions / directory symlinks)")
     ap.add_argument("--utc", action="store_true",
                     help="convert timezone-aware (full-iso) times to UTC")
+    ap.add_argument("--skew", type=parse_skew, default=0, metavar="OFFSET",
+                    help="how far the source clock was AHEAD of true time, e.g. 300, 5m, "
+                         "-1h30m; every timestamp is moved back by this much")
     ap.add_argument("--drop-followed-links", action="store_true",
                     help="drop Windows dir entries reached through a followed directory "
                          "symlink (e.g. C:\\Users\\All Users) when its target is also listed")
@@ -771,6 +790,10 @@ def main(argv=None):
     records = []
     all_skipped = []
     failed = False
+    skew = timedelta(seconds=args.skew)
+    if args.skew:
+        log.info(f"clock skew {args.skew:+d}s: all timestamps moved "
+                 f"{'back' if args.skew > 0 else 'forward'} by {abs(skew)}")
 
     def process(src, fh, label, order_hint=None):
         """Parse one listing stream into `records`."""
@@ -783,6 +806,8 @@ def main(argv=None):
                 if args.files_only and rec["type"] in DIR_LIKE:
                     filtered += 1
                     continue
+                rec["time"] -= skew
+                rec["clock_skew"] = args.skew
                 rec["source"] = f"{src}:{rec.pop('source_line')}"
                 rec["filename"] = args.prefix + rec["filename"]
                 rec["timestamp_type"] = label
@@ -884,7 +909,7 @@ def main(argv=None):
             w.writerow(["time", "directory", "source"])
             for src, p, e, order in all_skipped:
                 try:
-                    t = dir_datetime(e, order).isoformat()
+                    t = (dir_datetime(e, order) - skew).isoformat()
                 except ValueError:
                     t = ""
                 w.writerow([t, args.prefix + p, f"{src}:{e['lineno']}"])
@@ -893,12 +918,27 @@ def main(argv=None):
     if not args.no_sort:
         records.sort(key=sort_key, reverse=args.reverse)
 
+    # Anything dated after the capture day points at a fast clock or
+    # timestomping. Year-less ls dates can't show this: inference already
+    # pins them at or before --ref-date.
+    cutoff = datetime.combine(args.ref_date + timedelta(days=1), datetime.min.time())
+    future = [r for r in records if sort_key(r)[0] >= cutoff]
+    if future:
+        newest = max(future, key=sort_key)
+        n = len(future)
+        log.warning(f"{n} {'entry is' if n == 1 else 'entries are'} dated after "
+                    f"--ref-date {args.ref_date}; "
+                    f"newest {fmt_time(newest['time'], args.utc)} {newest['filename']} "
+                    "(clock skew? check --skew; or timestomping)")
+
     fields = ["time", "size", "filename"]
     if any(rec["timestamp_type"] for rec in records):
         fields.insert(1, "timestamp_type")
     if args.extended:
         fields += ["type", "perms", "links", "owner", "group", "link_target",
                    "precision", "year_inferred", "source"]
+        if args.skew:
+            fields.append("clock_skew")
 
     out = (open(args.output, "w", newline="", encoding="utf-8", errors="surrogateescape")
            if args.output else sys.stdout)

@@ -40,6 +40,7 @@ set K="HKCU\Control Panel\International"
 >>info.txt tzutil /g
 >>info.txt echo.
 >>info.txt ver
+>>info.txt w32tm /query /status 2>&1
 >>info.txt reg query %K% /v sShortDate
 >>info.txt reg query %K% /v sTimeFormat
 >>info.txt fsutil fsinfo drives

@@ -133,9 +133,9 @@ network share if one is available. Otherwise it writes to `C:\collect`.
 The script:
 
 - checks it's running elevated, and warns and pauses if it isn't
-- records the hostname, user, timezone, Windows version, date/time format,
-  the drive list, the drives it listed, and start and end times in
-  `info.txt`
+- records the hostname, user, timezone, Windows version, time service
+  status (`w32tm /query /status`), date/time format, the drive list, the
+  drives it listed, and start and end times in `info.txt`
 - finds every **fixed** drive and runs `dir /s` twice on each, once for
   modification times and once for creation times. The output files are
   `dir_<letter>_modified.txt`, `dir_<letter>_created.txt` and
@@ -171,6 +171,7 @@ set K="HKCU\Control Panel\International"
 >>info.txt tzutil /g
 >>info.txt echo.
 >>info.txt ver
+>>info.txt w32tm /query /status 2>&1
 >>info.txt reg query %K% /v sShortDate
 >>info.txt reg query %K% /v sTimeFormat
 >>info.txt fsutil fsinfo drives
@@ -200,7 +201,7 @@ a terminal it arrives with line breaks and fails. Both drive letters are
 hard-coded as `C:`, because `set X=` and `%X%` on one line don't work in cmd:
 
 ```bat
-mkdir C:\collect & cd /d C:\collect & compact /c /i /q C:\collect >nul & (echo start %DATE% %TIME% & hostname & whoami & tzutil /g & ver & reg query "HKCU\Control Panel\International" /v sShortDate) >info.txt & (whoami /groups | findstr /c:S-1-16-12288 /c:S-1-16-16384 >nul && echo elevated=yes || echo elevated=NO) >>info.txt & cmd /u /c "dir C:\ /s /a /-c /t:w >dir_C_modified.txt 2>dir_C_errors.txt" & cmd /u /c "dir C:\ /s /a /-c /t:c >dir_C_created.txt 2>nul" & cmd /v:on /c "echo end !DATE! !TIME!" >>info.txt & tar -a -cf collect.zip *.txt & certutil -hashfile collect.zip SHA256
+mkdir C:\collect & cd /d C:\collect & compact /c /i /q C:\collect >nul & (echo start %DATE% %TIME% & hostname & whoami & tzutil /g & ver & w32tm /query /status 2>&1 & reg query "HKCU\Control Panel\International" /v sShortDate) >info.txt & (whoami /groups | findstr /c:S-1-16-12288 /c:S-1-16-16384 >nul && echo elevated=yes || echo elevated=NO) >>info.txt & cmd /u /c "dir C:\ /s /a /-c /t:w >dir_C_modified.txt 2>dir_C_errors.txt" & cmd /u /c "dir C:\ /s /a /-c /t:c >dir_C_created.txt 2>nul" & cmd /v:on /c "echo end !DATE! !TIME!" >>info.txt & tar -a -cf collect.zip *.txt & certutil -hashfile collect.zip SHA256
 ```
 
 For another drive, paste the two `cmd /u /c "dir ..."` parts again with the
@@ -355,11 +356,13 @@ python3 shallowtimeline.py -q -o out.csv listing.txt     # no warnings, write to
 | `--keep-dots` | Include `.` and `..` entries. |
 | `--files-only` | Skip directories, including Windows junctions and directory symlinks. |
 | `--utc` | Convert timezone-aware (`--full-time`) timestamps to UTC. |
+| `--skew OFFSET` | How far the source clock was *ahead* of true time: `300`, `5m`, `-1h30m`, `2d`. Every timestamp is moved back by this much (forward for a negative value). With `-e`, a `clock_skew` column records it. |
 | `--drop-followed-links` | Drop Windows `dir` entries reached through a followed directory symlink (e.g. `C:\Users\All Users`) when the link's target was also listed. |
 | `--skipped-dirs FILE` | Write Windows `dir` directories that were listed but not read (likely access denied) to FILE as CSV. |
 | `-v, --verbose` | More detail on stderr: file and zip member sizes, entry counts by type, time range, precision and inferred years for each input, how the date order was chosen, entries dropped per followed link, every unparsed line, every skipped directory, and timings. |
 | `--debug` | Everything `--verbose` shows, plus a per-line trace (each directory header and ignored line), the first bytes and detected encoding of each input, why the format was detected, each symlink considered by `--drop-followed-links`, and Python tracebacks on errors. Expect tens of thousands of lines for a full disk. |
 | `-q, --quiet` | Only report errors, such as a truncated or corrupt file. No progress messages, warnings or summaries. |
+| `--version` | Print the version and exit. |
 
 ## Supported input
 
@@ -419,6 +422,8 @@ out of the timeline. A large cluster of them under one path, e.g.
   and atime with `-u`. Label each run with `--time-label`.
 - **Local time.** Timestamps are in the source system's local timezone
   unless the listing includes an offset (`--full-time`).
+- **The clock may be wrong.** A listing has no second source to check its
+  times against. See [Clock skew and time zones](#clock-skew-and-time-zones).
 - **Windows `dir` dates follow the machine's locale.** `03/04/2026` could be
   either March or April. The order is worked out from the data once any day
   is over 12. If none is, it uses the date format from `info.txt` when
@@ -437,6 +442,93 @@ out of the timeline. A large cluster of them under one path, e.g.
 - **It's a listing, not an image.** Deleted files, timestomped files, and
   anything `ls` couldn't read won't show up, or won't show up accurately.
   Treat the result as leads, not proof.
+
+## Clock skew and time zones
+
+Every time in a listing comes from the source machine's clock, in its local
+time zone, and nothing in the listing tells you whether that clock was right.
+Across several machines this matters more: two timelines that disagree by
+four minutes may describe one event, or two.
+
+**Measure the clock when you collect.** Record the target's time next to a
+clock you trust (your own, at that moment, is enough) and keep the
+difference in your notes.
+
+```sh
+# Linux
+date -u; timedatectl 2>/dev/null || ntpq -p 2>/dev/null
+# macOS
+date -u; sntp -d time.apple.com 2>&1 | tail -2
+```
+
+```bat
+rem Windows (collect.bat and the paste versions record these in info.txt)
+echo %DATE% %TIME%
+tzutil /g
+w32tm /query /status
+```
+
+`w32tm /query /status` shows where the clock comes from and when it last
+synced. If the box can reach the internet, `w32tm /stripchart
+/computer:pool.ntp.org /samples:3 /dataonly` prints the offset directly.
+Domain-joined Windows machines usually agree to within seconds, because
+Kerberos stops working beyond five minutes. Standalone boxes, appliances and
+VMs restored from snapshots can be off by hours or years.
+
+**Get UTC at the source where you can.** `ls` and `dir` print local time
+with no offset. Converting afterwards means applying the right offset to
+each timestamp, including the DST rule in force on that date. On Linux you
+can skip the problem:
+
+```sh
+TZ=UTC ls -alR --full-time / 2>/dev/null | gzip -c > listing.txt.gz
+```
+
+The output then carries `+0000` and is handled as timezone-aware. `dir` has
+no such option, so note the zone from `tzutil /g` (it's in `info.txt`) and
+take care around DST changes. A Linux listing also reveals its own zone:
+`/etc/localtime -> /usr/share/zoneinfo/Australia/Brisbane`.
+
+**Use the target's date for `--ref-date`.** Year inference assumes nothing
+is newer than the reference date. If the target's clock was a day fast,
+`Nov 9 13:00` with `--ref-date 2026-11-08` becomes 2025. Give the date the
+*target* thought it was, then correct the skew separately.
+
+**Correct a known skew with `--skew`.** It takes how far the clock was
+*ahead* and moves every timestamp back by that much:
+
+```sh
+# web01's clock was 4 min 30 s fast; db01's was 2 minutes slow
+python3 shallowtimeline.py --prefix web01: --skew 4m30s --ref-date 2026-10-30 web01.txt > a.csv
+python3 shallowtimeline.py --prefix db01:  --skew -2m   --ref-date 2026-10-30 db01.txt  > b.csv
+```
+
+The skew applies to the whole run, so correct each host in its own run, as
+above. With `-e`, a `clock_skew` column records the seconds applied, so the
+correction stays visible in the output. The original listing and its hash
+are untouched.
+
+**Look for anchors in the data itself.**
+
+- Entries dated **after the collection** mean a fast clock or timestomping.
+  The tool warns about them and `-r` sorts them to the top. Year-less `ls`
+  dates can't show this, because inference already pins them at or before
+  `--ref-date`; `dir`, `--full-time` and `ls -T` dates can.
+- **Logs with their own timestamps.** If the last line of `/var/log/syslog`
+  says 14:02 and the file's mtime says 14:07, that's five minutes of skew or
+  a time-zone mix-up.
+- **Known events.** The OS install, Windows Update packages under
+  `C:\Windows\servicing\Packages`, package-manager history, browser history.
+- **The collection's own files.** `dir_C_modified.txt`'s mtime should match
+  the `end` line in `info.txt`.
+- **The same event seen from two machines.** An SSH login is in the client's
+  `~/.ssh/known_hosts` mtime and the server's `auth.log`. A file copied over
+  SMB keeps its source mtime, so the destination's creation time measures
+  the two clocks against each other.
+
+**Don't over-read the precision.** With default `ls` output and `dir`,
+two events in the same minute on two machines have no reliable order. Even
+with seconds, ordering across hosts is only as good as the measured skew.
 
 ## If you can choose the command, choose a better one
 
